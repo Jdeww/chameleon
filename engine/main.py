@@ -16,6 +16,7 @@ import sys
 import time
 from pathlib import Path
 
+from engine.geometry import aabb
 from engine.resize import resize
 
 # Relative to the current working directory, which is /app both inside the
@@ -34,7 +35,7 @@ REQUIRED_BY_TYPE = {
 }
 
 
-def self_check(source: dict, output: dict) -> list[str]:
+def self_check(source: dict, output: dict, target_canvas: dict | None = None) -> list[str]:
     """Quick, non-authoritative sanity check so obvious mistakes are caught
     locally before you submit. This is NOT the official scorer — see
     RULES.md for what actually gates and grades your submission."""
@@ -43,46 +44,60 @@ def self_check(source: dict, output: dict) -> list[str]:
     if "canvas" not in output or "elements" not in output:
         return ["output is missing top-level 'canvas' or 'elements'"]
 
-    src_ids = {el["id"] for el in source["elements"]}
-    out_ids = {el.get("id") for el in output["elements"]}
-    if src_ids != out_ids:
+    src_ids = [el["id"] for el in source["elements"]]
+    out_ids = [el.get("id") for el in output["elements"]]
+    if set(src_ids) != set(out_ids):
         problems.append(
-            f"element id mismatch — missing {sorted(src_ids - out_ids)}, "
-            f"unexpected {sorted(out_ids - src_ids)}"
+            f"element id mismatch — missing {sorted(set(src_ids) - set(out_ids))}, "
+            f"unexpected {sorted(set(out_ids) - set(src_ids), key=str)}"
         )
+    dupes = sorted({i for i in out_ids if out_ids.count(i) > 1}, key=str)
+    if dupes:
+        problems.append(f"duplicate element ids: {dupes}")
 
     cw, ch = output["canvas"].get("width"), output["canvas"].get("height")
+    if target_canvas and (cw, ch) != (target_canvas["width"], target_canvas["height"]):
+        problems.append(f"canvas {cw}x{ch} != target {target_canvas['width']}x{target_canvas['height']}")
+
+    src = {el["id"]: el for el in source["elements"]}
     for el in output["elements"]:
-        for field in REQUIRED_COMMON:
-            if field not in el:
-                problems.append(f"element '{el.get('id')}': missing '{field}'")
-                continue
-        for field in REQUIRED_BY_TYPE.get(el.get("type"), []):
-            if field not in el:
-                problems.append(f"element '{el.get('id')}' (type={el.get('type')}): missing '{field}'")
-        if cw and ch and all(k in el for k in ("x", "y", "width", "height")):
-            x1, y1 = el["x"] + el["width"], el["y"] + el["height"]
-            if el["x"] < -0.5 or el["y"] < -0.5 or x1 > cw + 0.5 or y1 > ch + 0.5:
-                problems.append(f"element '{el.get('id')}' is off-canvas ({cw}x{ch})")
+        missing = [f for f in REQUIRED_COMMON if f not in el]
+        missing += [f for f in REQUIRED_BY_TYPE.get(el.get("type"), []) if f not in el]
+        if missing:
+            problems.append(f"element '{el.get('id')}' (type={el.get('type')}): missing {missing}")
+            continue
+        if cw and ch:
+            x0, y0, x1, y1 = aabb(el)  # rotated bounds, not just the unrotated box
+            if x0 < -0.5 or y0 < -0.5 or x1 > cw + 0.5 or y1 > ch + 0.5:
+                problems.append(f"element '{el['id']}' is off-canvas ({cw}x{ch})")
+        s = src.get(el["id"])
+        if s is None:
+            continue
+        if el["type"] == "text":
+            if el["content"] != s["content"] or el["font_family"] != s["font_family"]:
+                problems.append(f"element '{el['id']}': content or font_family changed")
+            if el["font_size"] < 1:
+                problems.append(f"element '{el['id']}': font_size < 1")
+        if el["type"] == "image" and s.get("fit") != "cover" and min(s["height"], el["height"]) > 0:
+            drift = abs((el["width"] / el["height"]) / (s["width"] / s["height"]) - 1)
+            if drift > 0.05:
+                problems.append(f"element '{el['id']}': aspect ratio off by {drift:.0%}")
 
     return problems
 
 
-def render_to_png(design: dict, assets_dir: Path, png_path: Path) -> None:
-    """Renders `design` to a PNG. Prefers the real renderer
-    (transformer-convertor, wrapping cr-renderer) if it's vendored into
-    ./renderer; falls back to a plain box-and-label preview otherwise so
-    this repo is runnable before that's wired in. Swap the fallback out
-    once ./renderer is populated — don't ship the fallback's output as a
-    real preview."""
+def render_to_png(design: dict, assets_dir: Path, png_path: Path) -> list[str]:
+    """Renders `design` to a PNG and returns the renderer's warnings (e.g.
+    missing assets). Prefers the real renderer (transformer-convertor,
+    wrapping cr-renderer) in ./renderer; falls back to a plain
+    box-and-label preview if it can't be imported — and says so, so a
+    broken install isn't mistaken for a real preview."""
     try:
         from renderer.converter.convert import render_design_to_png  # type: ignore
-        render_design_to_png(design, assets_dir, str(png_path))
-        return
-    except ImportError:
-        pass
-
-    _fallback_render(design, png_path)
+    except ImportError as exc:
+        _fallback_render(design, png_path)
+        return [f"real renderer unavailable ({exc}) - wrote placeholder boxes instead"]
+    return render_design_to_png(design, assets_dir, str(png_path))
 
 
 def _fallback_render(design: dict, png_path: Path) -> None:
@@ -114,23 +129,31 @@ def main() -> int:
 
     exit_code = 0
     for task_path in task_files:
-        task = json.loads(task_path.read_text())
-        source, target_canvas = task["source"], task["target_canvas"]
+        # One bad task must not stop the rest from being produced.
+        try:
+            task = json.loads(task_path.read_text(encoding="utf-8"))
+            source, target_canvas = task["source"], task["target_canvas"]
 
-        t0 = time.time()
-        output = resize(source, target_canvas)
-        elapsed = time.time() - t0
+            t0 = time.time()
+            output = resize(source, target_canvas)
+            elapsed = time.time() - t0
 
-        problems = self_check(source, output)
-        stem = task_path.stem
-        (OUTPUT_DIR / f"{stem}_output.json").write_text(json.dumps(output, indent=2))
-        render_to_png(output, ASSETS_DIR, OUTPUT_DIR / f"{stem}_output.png")
+            problems = self_check(source, output, target_canvas)
+            stem = task_path.stem
+            (OUTPUT_DIR / f"{stem}_output.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
+            render_warnings = render_to_png(output, ASSETS_DIR, OUTPUT_DIR / f"{stem}_output.png")
+        except Exception as exc:
+            exit_code = 1
+            print(f"[{task_path.name}] FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
 
         status = "OK" if not problems else f"{len(problems)} self-check warning(s)"
         print(f"[{task_path.name}] {status} in {elapsed:.2f}s "
               f"-> {stem}_output.json, {stem}_output.png")
         for p in problems:
             print(f"    - {p}")
+        for w in render_warnings:
+            print(f"    (renderer) {w}")
 
     return exit_code
 

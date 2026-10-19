@@ -8,6 +8,11 @@ the Dockerfile) is plumbing so you can focus on exactly one function:
 
 from typing import Any
 
+from engine.analyze import analyze
+from engine.geometry import aabb
+from engine.layouts import candidates
+from engine.score import score
+
 
 def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, Any]:
     """
@@ -38,38 +43,48 @@ def resize(source: dict[str, Any], target_canvas: dict[str, Any]) -> dict[str, A
           "Adaptive typography and copy").
         - Nothing should end up outside `target_canvas`'s bounds.
 
-    This is where your actual approach goes: constraint solving, a learned
-    layout model, heuristics, whatever you choose. Latency is not a scoring
-    concern (see RULES.md) — spend your effort on quality, not speed.
+    Approach (layout retargeting, no ML):
+      1. analyze.py  - split elements into background / decor / units
+                       (a group_id is one rigid unit) and guess roles.
+      2. layouts.py  - build candidate layouts: proportional re-map,
+                       vertical stacks, and column arrangements for wide
+                       targets. Text is re-fitted with real glyph metrics.
+      3. score.py    - pick the candidate with the most legible text,
+                       best-sized imagery and no content overlaps.
+      4. below       - assemble every source id exactly once and clamp
+                       anything still poking outside the canvas.
     """
-
-    # ------------------------------------------------------------------
-    # Naive baseline so this file runs out of the box. This is a uniform
-    # stretch — literally the thing the brief tells you NOT to do ("a
-    # naive program stretches the picture; a good one moves the
-    # furniture"). It's here so `python -m engine.main` produces valid,
-    # schema-correct output on day one. Replace the body of this function;
-    # do not just tune these three lines.
-    # ------------------------------------------------------------------
-    scale_x = target_canvas["width"] / source["canvas"]["width"]
-    scale_y = target_canvas["height"] / source["canvas"]["height"]
+    an = analyze(source)
+    W, H = float(target_canvas["width"]), float(target_canvas["height"])
+    best = max(candidates(an, target_canvas), key=lambda pl: score(pl, an, W, H))
 
     out_elements = []
     for el in source["elements"]:
-        el = dict(el)  # shallow copy — don't mutate the input
-        el["x"] = el["x"] * scale_x
-        el["y"] = el["y"] * scale_y
-        el["width"] = el["width"] * scale_x
-        el["height"] = el["height"] * scale_y
-        if el["type"] == "text":
-            # font_size scaling isn't required to be uniform — this is
-            # just a starting point. Floored at 1px: the schema requires
-            # font_size >= 1, and an extreme downscale (e.g. a tall poster
-            # squeezed into a short banner) can otherwise compute < 1.
-            el["font_size"] = max(1.0, el["font_size"] * min(scale_x, scale_y))
-        out_elements.append(el)
+        out = dict(best.elements.get(el["id"], el))  # never drop an id
+        _clamp_into(out, W, H)
+        for key in ("x", "y", "width", "height"):
+            out[key] = round(out[key], 2)
+        out_elements.append(out)
 
     return {
         "canvas": {"width": target_canvas["width"], "height": target_canvas["height"]},
         "elements": out_elements,
     }
+
+
+def _clamp_into(el: dict[str, Any], W: float, H: float) -> None:
+    """Shrink (uniformly, about the center) and shift `el` so its rotated
+    bounding box lies inside the canvas."""
+    x0, y0, x1, y1 = aabb(el)
+    bw, bh = x1 - x0, y1 - y0
+    f = min(1.0, W / bw if bw else 1.0, H / bh if bh else 1.0)
+    if f < 1.0:
+        cx, cy = el["x"] + el["width"] / 2, el["y"] + el["height"] / 2
+        el["width"] *= f
+        el["height"] *= f
+        el["x"], el["y"] = cx - el["width"] / 2, cy - el["height"] / 2
+        if el["type"] == "text":
+            el["font_size"] = max(1, int(el["font_size"] * f))
+        x0, y0, x1, y1 = aabb(el)
+    el["x"] += max(0.0, -x0) - max(0.0, x1 - W)
+    el["y"] += max(0.0, -y0) - max(0.0, y1 - H)

@@ -20,3 +20,9 @@ venv/
 # Generated run artifacts
 output/*
 !output/.gitkeep
+
+# Local-only test tooling (not needed by the engine or the Docker image)
+tests/
+tools/
+pytest.ini
+requirements-dev.txt
